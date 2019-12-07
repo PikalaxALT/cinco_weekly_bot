@@ -41,13 +41,16 @@ class Race(commands.Cog):
     def gen_hash(timestamp):
         return base64.b32encode(hash(timestamp).to_bytes(8, 'little')).decode().rstrip('=')
 
-    def __init__(self, bot):
-        super().__init__(bot)
+    def __init__(self):
+        super().__init__()
         self.db: typing.Optional[asyncpg.Connection] = None
         self.update_db.start()
 
     def cog_unload(self):
         self.update_db.cancel()
+        exc = self.update_db._task.exception
+        if exc is not None and not isinstance(exc, asyncio.CancelledError):
+            raise exc
 
     @tasks.loop(minutes=10)
     async def update_db(self):
@@ -303,4 +306,4 @@ class Race(commands.Cog):
 
 
 def setup(bot):
-    bot.add_cog(Race(bot))
+    bot.add_cog(Race())
