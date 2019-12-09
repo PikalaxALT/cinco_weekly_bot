@@ -8,6 +8,14 @@ import asyncio
 import datetime
 
 
+class NotEnoughRacers:
+    pass
+
+
+class NotReady:
+    pass
+
+
 class NoGuildConfig:
     pass
 
@@ -109,6 +117,16 @@ class Race(commands.Cog):
             raise RaceDoesNotExist
         return record
 
+    async def _get_racers(self, ctx: commands.Context, code=None):
+        if code is None:
+            code = (await self._get_race_settings(ctx))['hash']
+        records = await self.db.fetch("""
+            SELECT (*) from $1
+        """)
+        if records is None:
+            raise RaceDoesNotExist
+        return records
+
     async def _get_racer(self, ctx: commands.Context, code=None):
         if code is None:
             code = (await self._get_race_settings(ctx))['hash']
@@ -162,35 +180,36 @@ class Race(commands.Cog):
     @commands.has_permissions(administrator=True)
     @commands.check(guild_has_no_category)
     async def config(self, ctx):
-        overwrites = discord.PermissionOverwrite(read_message_history=False, send_messages=False, read_messages=False, connect=False, speak=False)
+        overwrites = discord.PermissionOverwrite(send_messages=False, read_messages=False, connect=False, speak=False)
         category = await ctx.guild.create_category_channel('Races', overwrites=overwrites)
         category2 = await ctx.guild.create_category_channel('Race Archive')
         await self.db.execute("""
             INSERT INTO config(guild, category, archive) VALUES ($1, $2, $3)
         """, ctx.guild.id, category.id, category2.id)
 
-    @commands.command()
+    @commands.command(name='race')
     @commands.bot_has_permissions(manage_channels=True, manage_roles=True, manage_members=True)
     @commands.check(guild_has_category)
-    async def new_race(self, ctx: commands.Context, casual=False):
+    async def new_race(self, ctx: commands.Context, tourney=False):
         category = ctx.guild.get_channel((await self._get_guild_config(ctx))['category'])
         now = time.time()
         code = Race.gen_hash(now)
         role = await ctx.guild.create_role(name=f'Racer {code}')
-        overwrites = discord.PermissionOverwrite(read_message_history=True, send_messages=True, read_messages=True, connect=True, speak=True)
+        overwrites = discord.PermissionOverwrite(send_messages=True, read_messages=True, connect=True, speak=True)
         channel = await category.create_text_channel(f'race-{code.lower()}', overwrites={role: overwrites})
-        if casual:
+        if not tourney:
             vc = await category.create_voice_channel(f'Race Comms {code}', overwrites={role: overwrites})
         else:
             vc = None
         await self.db.execute("""
             INSERT INTO races(code, host, channel, role, voicechan) VALUES ($1, $2, $3, $4, $5)
-        """, code, ctx.author.id, channel.id, role.id, vc.id)
+        """, code, ctx.author.id, channel.id, role.id, None if vc is None else vc.id)
         await self.db.execute("""
             CREATE TABLE $1(
                 id integer PRIMARY KEY,
                 ishost boolean NOT NULL DEFAULT FALSE,
-                finished timestamp
+                finished timestamp,
+                ready boolean NOT NULL DEFAULT FALSE
             )
         """, code)
         await self.db.execute("""
@@ -200,6 +219,7 @@ class Race(commands.Cog):
         await ctx.send(f'New race channel {channel.mention} created. To join, type `{ctx.prefix}{self.join} {code}`')
         await channel.send(f'{ctx.author.mention}: You are the host of this race. When everyone has joined in, '
                            f'type `{ctx.prefix}{self.start}` to start the race.')
+        await channel.send(f'To toggle your ready state, type `{ctx.prefix}{self.ready}.')
 
     @commands.command()
     @commands.bot_has_permissions(manage_members=True)
@@ -218,11 +238,29 @@ class Race(commands.Cog):
         await channel.send(f'Player {ctx.author.mention} has joined the race!')
 
     @commands.command()
+    @commands.check(is_not_started)
+    async def ready(self, ctx: commands.Context):
+        record = await self._get_race_settings(ctx)
+        racer = await self._get_racer(ctx, record['hash'])
+        await self.db.execute("""
+            UPDATE $1 SET ready=NOT ready where id=$2
+        """, record['hash'], ctx.author.id)
+        if racer['ready']:
+            await ctx.send(f'{ctx.author.display_name} is no longer ready to start.')
+        else:
+            await ctx.send(f'{ctx.author.display_name} is ready to start!')
+
+    @commands.command()
     @commands.check(guild_has_category)
     @commands.check(is_host)
     @commands.check(is_not_started)
     async def start(self, ctx: commands.Context):
         record = await self._get_race_settings(ctx)
+        racers = await self._get_racers(ctx, record['hash'])
+        if len(racers) < 2:
+            raise NotEnoughRacers
+        if len(racers) != sum(row['ready'] for row in racers):
+            raise NotReady
         await self.db.execute("""
             UPDATE races SET started=$2 WHERE hash=$1
         """, record['hash'], time.time())
@@ -238,13 +276,7 @@ class Race(commands.Cog):
                        f'To declare yourself done and get your official time, type {ctx.prefix}{self.done}.\n'
                        f'To forfeit, type {ctx.prefix}{self.forfeit}.')
 
-    async def handle_race_finished(self, ctx, code):
-        for row in await self.db.fetch("""
-            SELECT (*) FROM $1
-        """, code):
-            if row['finished'] is None:
-                return False
-        await ctx.send('The race has finished. The channel will now be archived.')
+    async def end_race(self, ctx: commands.Context, code=None):
         archive = ctx.guild.get_channel((await self._get_guild_config(ctx))['archive'])
         record = await self._get_race_settings(ctx, code)
         channel = ctx.guild.get_channel(record['channel'])
@@ -257,6 +289,19 @@ class Race(commands.Cog):
         await self.db.execute("""
             DROP TABLE $1
         """, code)
+
+    async def handle_race_finished(self, ctx: commands.Context, code):
+        for row in await self._get_racers(ctx, code):
+            if row['finished'] is None:
+                return False
+        await ctx.send('The race has finished. The channel will now be archived.')
+        await self.end_race(ctx, code)
+
+    @commands.command()
+    @is_host
+    async def cancel(self, ctx: commands.Context):
+        await ctx.send('The race has been canceled. The channel will now be archived.')
+        await self.end_race(ctx)
 
     @commands.command()
     @commands.check(guild_has_category)
@@ -288,21 +333,25 @@ class Race(commands.Cog):
 
     async def cog_command_error(self, ctx: commands.Context, error: Exception):
         if isinstance(error, NoGuildConfig):
-            await ctx.send(f'This server is not configured. Please run {ctx.prefix}{self.config}.')
+            await ctx.send(f'This server is not configured. Please run {ctx.prefix}{self.config}.', delete_after=10)
         elif isinstance(error, GuildConfigExists):
-            await ctx.send('This server already has a race category.')
+            await ctx.send('This server already has a race category.', delete_after=10)
         elif isinstance(error, RaceNotStarted):
-            await ctx.send('You cannot use this command before the race has begun.')
+            await ctx.send('You cannot use this command before the race has begun.', delete_after=10)
         elif isinstance(error, RaceDoesNotExist):
-            await ctx.send('The indicated race does not exist, or you are using this command outside a race channel.')
+            await ctx.send('The indicated race does not exist, or you are using this command outside a race channel.', delete_after=10)
         elif isinstance(error, NotHost):
-            await ctx.send('Only the race host may start the race.')
+            await ctx.send('Only the race host may start the race.', delete_after=10)
         elif isinstance(error, NotRacing):
-            await ctx.send('You are not a participant in this race, or you have already finished or forfeited.')
+            await ctx.send('You are not a participant in this race, or you have already finished or forfeited.', delete_after=10)
         elif isinstance(error, RaceAlreadyStarted):
-            await ctx.send('This race cannot be started more than once.')
+            await ctx.send('This race cannot be started more than once.', delete_after=10)
+        elif isinstance(error, NotEnoughRacers):
+            await ctx.send('Need at least two racers to start a race.', delete_after=10)
+        elif isinstance(error, NotReady):
+            await ctx.send('All racers must indicate "ready" before you can start', delete_after=10)
         else:
-            await ctx.send(f'Unhandled {error.__class__.__name__} in {ctx.command}: {error}')
+            await ctx.send(f'Unhandled {error.__class__.__name__} in {ctx.command}: {error}', delete_after=10)
 
 
 def setup(bot):
