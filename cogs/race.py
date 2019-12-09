@@ -49,8 +49,9 @@ class Race(commands.Cog):
     def gen_hash(timestamp):
         return base64.b32encode(hash(timestamp).to_bytes(8, 'little')).decode().rstrip('=')
 
-    def __init__(self):
+    def __init__(self, bot):
         super().__init__()
+        self.bot = bot
         self.db: typing.Optional[asyncpg.Connection] = None
         self.update_db.start()
 
@@ -66,7 +67,7 @@ class Race(commands.Cog):
 
     @update_db.before_loop
     async def init_db(self):
-        self.db = await asyncpg.connect()
+        self.db = await asyncpg.connect(user=self.bot.postgre_user, password=self.bot.postgre_pass)
         try:
             await self.db.execute("""
             CREATE TABLE config(
@@ -355,4 +356,4 @@ class Race(commands.Cog):
 
 
 def setup(bot):
-    bot.add_cog(Race())
+    bot.add_cog(Race(bot))
