@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 from discord.ext import commands
-import discord
 import config
 
 
@@ -24,7 +23,5 @@ class Bot(commands.Bot):
 
 
 bot = Bot(pguser=config.postgre_user, pgpass=config.postgre_pass)
-
-# write general commands here
 
 bot.run(config.token)
