@@ -44,49 +44,36 @@ class Race(commands.Cog):
     def __init__(self):
         super().__init__()
         self.db: typing.Optional[asyncpg.Connection] = None
-        self.update_db.start()
+        asyncio.create_task(self.init_db())
 
-    def cog_unload(self):
-        self.update_db.cancel()
-        exc = self.update_db._task.exception
-        if exc is not None and not isinstance(exc, asyncio.CancelledError):
-            raise exc
-
-    @tasks.loop(minutes=10)
-    async def update_db(self):
-        await self.db.commit()
-
-    @update_db.before_loop
     async def init_db(self):
         self.db = await asyncpg.connect()
-        try:
+        async with self.db.transaction():
             await self.db.execute("""
-            CREATE TABLE config(
-                guild integer PRIMARY KEY,
-                category integer not null,
-                archive integer not null
+            CREATE TABLE IF NOT EXISTS config(
+                guild BIGINT PRIMARY KEY,
+                category BIGINT NOT NULL,
+                archive BIGINT NOT NULL
             )
             """)
-        finally:
-            pass
-        try:
             await self.db.execute("""
-            CREATE TABLE races(
-                hash text PRIMARY KEY not null,
-                host integer not null,
-                started timestamp,
-                channel integer not null,
-                role integer not null,
-                voicechan integer
+            CREATE TABLE IF NOT EXISTS races(
+                hash TEXT PRIMARY KEY NOT NULL,
+                host BIGINT NOT NULL,
+                started TIMESTAMP,
+                channel BIGINT NOT NULL,
+                role BIGINT NOT NULL,
+                voicechan BIGINT
             )
             """)
-        finally:
-            pass
-
-    @update_db.after_loop
-    async def close_db(self):
-        await self.db.close()
-        self.db = None
+            await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS racers(
+                hash text PRIMARY KEY NOT NULL,
+                id BIGINT NOT NULL,
+                ishost BOOLEAN DEFAULT FALSE,
+                finished TIMESTAMP
+            )
+            """)
 
     async def _get_guild_config(self, ctx: commands.Context):
         category = await self.db.fetchrow("""
@@ -113,7 +100,7 @@ class Race(commands.Cog):
         if code is None:
             code = (await self._get_race_settings(ctx))['hash']
         record = await self.db.fetchrow("""
-            SELECT (*) from $1 where id = $2
+            SELECT (id, ishost, finished) FROM racers WHERE hash = $1 AND id = $2
         """, code, ctx.author.id)
         if record is None:
             raise NotRacing
@@ -183,19 +170,13 @@ class Race(commands.Cog):
             vc = await category.create_voice_channel(f'Race Comms {code}', overwrites={role: overwrites})
         else:
             vc = None
-        await self.db.execute("""
-            INSERT INTO races(code, host, channel, role, voicechan) VALUES ($1, $2, $3, $4, $5)
-        """, code, ctx.author.id, channel.id, role.id, vc.id)
-        await self.db.execute("""
-            CREATE TABLE $1(
-                id integer PRIMARY KEY,
-                ishost boolean NOT NULL DEFAULT FALSE,
-                finished timestamp
-            )
-        """, code)
-        await self.db.execute("""
-            INSERT INTO $1(id, ishost) VALUES ($2, TRUE)
-        """, code, ctx.author.id)
+        async with self.db.transaction():
+            await self.db.execute("""
+                INSERT INTO races(code, host, channel, role, voicechan) VALUES ($1, $2, $3, $4, $5)
+            """, code, ctx.author.id, channel.id, role.id, vc.id)
+            await self.db.execute("""
+                INSERT INTO racers(hash, id, ishost) VALUES ($1, $2, TRUE)
+            """, code, ctx.author.id)
         await ctx.author.add_roles(role)
         await ctx.send(f'New race channel {channel.mention} created. To join, type `{ctx.prefix}{self.join} {code}`')
         await channel.send(f'{ctx.author.mention}: You are the host of this race. When everyone has joined in, '
@@ -210,7 +191,7 @@ class Race(commands.Cog):
         if record['started'] is not None:
             raise RaceAlreadyStarted
         await self.db.execute("""
-            INSERT INTO $1(id) VALUES ($2)
+            INSERT INTO racers(hash, id) VALUES ($1, $2)
         """, code, ctx.author.id)
         channel = category.get_channel(record['channel'])
         role = ctx.guild.get_role(record['role'])
@@ -240,7 +221,7 @@ class Race(commands.Cog):
 
     async def handle_race_finished(self, ctx, code):
         for row in await self.db.fetch("""
-            SELECT (*) FROM $1
+            SELECT finished FROM racers WHERE hash = $1
         """, code):
             if row['finished'] is None:
                 return False
@@ -255,7 +236,7 @@ class Race(commands.Cog):
             voicechan = ctx.guild.get_channel(record['voicechan'])
             await voicechan.edit(category=archive)
         await self.db.execute("""
-            DROP TABLE $1
+            DELETE FROM racers WHERE hash = $1 
         """, code)
 
     @commands.command()
@@ -268,7 +249,7 @@ class Race(commands.Cog):
         start_time = race['started']
         duration = datetime.timedelta(seconds=now - start_time)
         await self.db.execute("""
-            UPDATE $1 SET finished=$2 WHERE id=$3
+            UPDATE racers SET finished=$2 WHERE hash = $1 AND id = $3
         """, race['hash'], now, ctx.author.id)
         await ctx.send(f'{ctx.author.mention} has finished the race with an official time of {duration}')
         await self.handle_race_finished(ctx, race['hash'])
@@ -281,7 +262,7 @@ class Race(commands.Cog):
         race = await self._get_race_settings(ctx)
         start_time = race['started']
         await self.db.execute("""
-            UPDATE $1 SET finished=$2 WHERE id=$3
+            UPDATE racers SET finished=$2 WHERE hash = $1 AND id = $3
         """, race['hash'], start_time + 18000, ctx.author.id)
         await ctx.send(f'{ctx.author.mention} has forfeited from the race.')
         await self.handle_race_finished(ctx, race['hash'])
